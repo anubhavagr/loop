@@ -5,36 +5,39 @@
 //! refuse to talk to. Tests that need to exercise the happy path opt into
 //! `allowPrivateAddresses`, mirroring the documented intranet-mirror setting.
 
-use loop_agent::harness::{create_web_fetch_tool, create_web_search_tool};
+use loop_agent::harness::{create_web_fetch_tool, create_web_search_tool, verify_web_search_key};
 use loop_agent::types::AgentTool;
 use loop_test_support::{FakeHttpServer, FakeResponse};
 use serde_json::json;
 
 /// `AgentTool` is not `Debug`, so `expect_err` is unavailable.
-fn expect_creation_error(result: Result<AgentTool, String>, ctx: &str) -> String {
+fn expect_creation_error(result: Result<AgentTool, String>, context: &str) -> String {
     match result {
-        Ok(_) => panic!("{ctx}: expected an error"),
-        Err(e) => e,
+        Ok(_) => panic!("{context}: expected an error"),
+        Err(error) => error,
     }
 }
 
-fn lenient_fetch() -> AgentTool {
+/// A `web_fetch` tool that may talk to the fake server on 127.0.0.1
+/// (the documented intranet-mirror opt-in).
+fn fetch_tool_allowing_private_hosts() -> AgentTool {
     create_web_fetch_tool(loop_agent::harness::WebFetchConfig {
         allow_private_addresses: true,
     })
     .expect("web_fetch tool")
 }
 
-async fn run(
+async fn execute_tool(
     tool: &AgentTool,
     args: serde_json::Value,
 ) -> Result<loop_agent::types::AgentToolResult, String> {
     (tool.execute)("test".into(), args, None, None).await
 }
 
-fn text_of(result: &loop_agent::types::AgentToolResult) -> String {
+/// The text content of a tool result (empty when the result has none).
+fn result_text(result: &loop_agent::types::AgentToolResult) -> String {
     match result.content.first() {
-        Some(loop_ai::ToolResultContent::Text(t)) => t.text.clone(),
+        Some(loop_ai::ToolResultContent::Text(text)) => text.text.clone(),
         _ => String::new(),
     }
 }
@@ -47,11 +50,11 @@ async fn fetch_converts_html_to_text() {
         r#"<html><head><script>alert(1)</script></head>
            <body><h1>Hello</h1><p>World &amp; more</p><ul><li>a</li><li>b</li></ul></body></html>"#,
     ));
-    let tool = lenient_fetch();
-    let result = run(&tool, json!({"url": format!("{}/page", server.base_url())}))
+    let tool = fetch_tool_allowing_private_hosts();
+    let result = execute_tool(&tool, json!({"url": format!("{}/page", server.base_url())}))
         .await
         .expect("fetch ok");
-    let text = text_of(&result);
+    let text = result_text(&result);
     assert!(text.contains("Hello"));
     assert!(text.contains("World & more"));
     assert!(text.contains("- a"));
@@ -65,12 +68,12 @@ async fn fetch_passes_json_through() {
     let server = FakeHttpServer::always(FakeResponse::json(
         r#"{"models": ["m1", "m2"], "object": "list"}"#,
     ));
-    let tool = lenient_fetch();
-    let result = run(&tool, json!({"url": server.base_url()}))
+    let tool = fetch_tool_allowing_private_hosts();
+    let result = execute_tool(&tool, json!({"url": server.base_url()}))
         .await
         .expect("fetch ok");
     assert_eq!(
-        text_of(&result),
+        result_text(&result),
         r#"{"models": ["m1", "m2"], "object": "list"}"#
     );
 }
@@ -82,14 +85,14 @@ async fn fetch_follows_redirects_and_reports_origin() {
         "/final" => FakeResponse::new(200, "text/plain", "landed"),
         _ => FakeResponse::new(404, "text/plain", "nope"),
     });
-    let tool = lenient_fetch();
-    let result = run(
+    let tool = fetch_tool_allowing_private_hosts();
+    let result = execute_tool(
         &tool,
         json!({"url": format!("{}/start", server.base_url())}),
     )
     .await
     .expect("fetch ok");
-    assert_eq!(text_of(&result), "landed");
+    assert_eq!(result_text(&result), "landed");
     assert_eq!(
         result.details["url"],
         json!(format!("{}/final", server.base_url()))
@@ -105,8 +108,8 @@ async fn fetch_follows_redirects_and_reports_origin() {
 #[tokio::test]
 async fn fetch_reports_http_errors() {
     let server = FakeHttpServer::always(FakeResponse::new(404, "text/plain", "missing"));
-    let tool = lenient_fetch();
-    let err = run(&tool, json!({"url": server.base_url()}))
+    let tool = fetch_tool_allowing_private_hosts();
+    let err = execute_tool(&tool, json!({"url": server.base_url()}))
         .await
         .expect_err("404 must be an error");
     assert!(err.contains("404"), "unexpected error: {err}");
@@ -116,7 +119,7 @@ async fn fetch_reports_http_errors() {
 async fn fetch_rejects_private_addresses_by_default() {
     let server = FakeHttpServer::always(FakeResponse::new(200, "text/plain", "secret"));
     let tool = create_web_fetch_tool(Default::default()).expect("web_fetch tool");
-    let err = run(&tool, json!({"url": server.base_url()}))
+    let err = execute_tool(&tool, json!({"url": server.base_url()}))
         .await
         .expect_err("strict policy must refuse loopback");
     assert!(err.contains("refusing"), "unexpected error: {err}");
@@ -126,13 +129,13 @@ async fn fetch_rejects_private_addresses_by_default() {
 
 #[tokio::test]
 async fn fetch_rejects_non_http_schemes_and_credentials() {
-    let tool = lenient_fetch();
+    let tool = fetch_tool_allowing_private_hosts();
     for url in [
         "file:///etc/passwd",
         "ftp://example.com/pub",
         "https://user:pass@example.com/",
     ] {
-        let err = match run(&tool, json!({"url": url})).await {
+        let err = match execute_tool(&tool, json!({"url": url})).await {
             Err(err) => err,
             Ok(_) => panic!("{url} must be rejected"),
         };
@@ -144,19 +147,19 @@ async fn fetch_rejects_non_http_schemes_and_credentials() {
 async fn fetch_truncates_large_bodies() {
     let body = "word ".repeat(40_000); // 200 KB > the 50 KB model cap
     let server = FakeHttpServer::always(FakeResponse::new(200, "text/plain", body));
-    let tool = lenient_fetch();
-    let result = run(&tool, json!({"url": server.base_url()}))
+    let tool = fetch_tool_allowing_private_hosts();
+    let result = execute_tool(&tool, json!({"url": server.base_url()}))
         .await
         .expect("fetch ok");
     assert_eq!(result.details["truncated"], true);
-    assert!(text_of(&result).len() <= 50_000);
+    assert!(result_text(&result).len() <= 50_000);
 }
 
 #[tokio::test]
 async fn fetch_rejects_unsupported_content_types() {
     let server = FakeHttpServer::always(FakeResponse::new(200, "image/png", vec![1, 2, 3]));
-    let tool = lenient_fetch();
-    let err = run(&tool, json!({"url": server.base_url()}))
+    let tool = fetch_tool_allowing_private_hosts();
+    let err = execute_tool(&tool, json!({"url": server.base_url()}))
         .await
         .expect_err("images must be rejected");
     assert!(err.contains("image/png"), "unexpected error: {err}");
@@ -189,10 +192,10 @@ async fn search_tavily_backend() {
         None,
     )
     .expect("web_search tool");
-    let result = run(&tool, json!({"query": "rust language", "max_results": 2}))
+    let result = execute_tool(&tool, json!({"query": "rust language", "max_results": 2}))
         .await
         .expect("search ok");
-    let text = text_of(&result);
+    let text = result_text(&result);
     assert!(text.contains("1. Rust"));
     assert!(text.contains("https://rust-lang.org"));
     assert!(text.contains("Systems language"));
@@ -221,10 +224,10 @@ async fn search_brave_backend() {
     ));
     let tool = create_web_search_tool(search_config(&server, "LOOP_TEST_BRAVE_KEY", "brave"), None)
         .expect("web_search tool");
-    let result = run(&tool, json!({"query": "rust"}))
+    let result = execute_tool(&tool, json!({"query": "rust"}))
         .await
         .expect("search ok");
-    assert!(text_of(&result).contains("https://rust-lang.org"));
+    assert!(result_text(&result).contains("https://rust-lang.org"));
 
     let requests = server.requests();
     assert_eq!(requests.len(), 1);
@@ -299,7 +302,7 @@ async fn search_clamps_max_results() {
         None,
     )
     .expect("web_search tool");
-    run(&tool, json!({"query": "x", "max_results": 99}))
+    execute_tool(&tool, json!({"query": "x", "max_results": 99}))
         .await
         .expect("search ok");
     let body: serde_json::Value = serde_json::from_slice(&server.requests()[0].body).unwrap();
@@ -317,7 +320,9 @@ async fn search_uses_the_stored_login_key() {
     let mut config = search_config(&server, "LOOP_TEST_STORED_KEY", "tavily");
     config.api_key_env = vec![];
     let tool = create_web_search_tool(config, Some("tvly-stored")).expect("web_search tool");
-    run(&tool, json!({"query": "q"})).await.expect("search ok");
+    execute_tool(&tool, json!({"query": "q"}))
+        .await
+        .expect("search ok");
     assert_eq!(
         server.requests()[0].header("authorization"),
         Some("Bearer tvly-stored")
@@ -335,7 +340,9 @@ async fn search_env_key_overrides_the_stored_key() {
         Some("tvly-stored"),
     )
     .expect("web_search tool");
-    run(&tool, json!({"query": "q"})).await.expect("search ok");
+    execute_tool(&tool, json!({"query": "q"}))
+        .await
+        .expect("search ok");
     assert_eq!(
         server.requests()[0].header("authorization"),
         Some("Bearer tvly-from-env")
@@ -344,8 +351,6 @@ async fn search_env_key_overrides_the_stored_key() {
 
 #[tokio::test]
 async fn key_verification_probes_and_reports_rejections() {
-    use loop_agent::harness::verify_web_search_key;
-
     let ok = FakeHttpServer::always(FakeResponse::json(
         r#"{"results":[{"title":"t","url":"https://t","content":"c"}]}"#,
     ));
@@ -360,4 +365,73 @@ async fn key_verification_probes_and_reports_rejections() {
         .await
         .expect_err("401 must fail verification");
     assert!(err.contains("rejected"), "unexpected error: {err}");
+}
+
+#[tokio::test]
+async fn fetch_rejects_redirects_to_other_schemes() {
+    let server = FakeHttpServer::always(
+        FakeResponse::new(302, "text/plain", "").with_header("Location", "ftp://example.com/file"),
+    );
+    let tool = fetch_tool_allowing_private_hosts();
+    let err = execute_tool(&tool, json!({"url": server.base_url()}))
+        .await
+        .expect_err("non-http redirect targets must be rejected");
+    assert!(err.contains("scheme"), "unexpected error: {err}");
+    // Only the first (rejected) hop was made.
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn fetch_stops_redirect_loops() {
+    let server = FakeHttpServer::start(|request| match request.path.as_str() {
+        "/a" => FakeResponse::new(302, "text/plain", "").with_header("Location", "/b"),
+        _ => FakeResponse::new(302, "text/plain", "").with_header("Location", "/a"),
+    });
+    let tool = fetch_tool_allowing_private_hosts();
+    let err = execute_tool(&tool, json!({"url": format!("{}/a", server.base_url())}))
+        .await
+        .expect_err("a redirect loop must terminate with an error");
+    assert!(
+        err.contains("too many redirects"),
+        "unexpected error: {err}"
+    );
+    // 1 initial request + 5 followed redirects.
+    assert_eq!(server.requests().len(), 6);
+}
+
+#[tokio::test]
+async fn fetch_strips_utf8_byte_order_mark() {
+    let server = FakeHttpServer::always(FakeResponse::new(
+        200,
+        "text/plain",
+        "\u{feff}hello".to_string().into_bytes(),
+    ));
+    let tool = fetch_tool_allowing_private_hosts();
+    let result = execute_tool(&tool, json!({"url": server.base_url()}))
+        .await
+        .expect("fetch ok");
+    assert_eq!(result_text(&result), "hello");
+}
+
+#[tokio::test]
+async fn fetch_handles_empty_bodies() {
+    let server = FakeHttpServer::always(FakeResponse::new(200, "text/plain", ""));
+    let tool = fetch_tool_allowing_private_hosts();
+    let result = execute_tool(&tool, json!({"url": server.base_url()}))
+        .await
+        .expect("fetch ok");
+    assert_eq!(result_text(&result), "");
+    assert_eq!(result.details["bytes"], 0);
+    assert_eq!(result.details["truncated"], false);
+}
+
+#[tokio::test]
+async fn fetch_treats_empty_content_type_as_plain_text() {
+    let server = FakeHttpServer::always(FakeResponse::new(200, "", "raw words"));
+    let tool = fetch_tool_allowing_private_hosts();
+    let result = execute_tool(&tool, json!({"url": server.base_url()}))
+        .await
+        .expect("fetch ok");
+    assert_eq!(result_text(&result), "raw words");
+    assert_eq!(result.details["contentType"], "text/plain");
 }

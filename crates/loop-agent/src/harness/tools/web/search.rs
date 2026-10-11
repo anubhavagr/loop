@@ -40,6 +40,44 @@ pub struct SearchHit {
     pub snippet: String,
 }
 
+/// Built-in backend registry — the single source of truth for backend ids,
+/// display names and defaults. `/login` validation (loop-app-core) and the
+/// login wizard (loop-cli) consult it; adding a backend is one entry here.
+#[derive(Debug)]
+pub struct WebSearchBackendInfo {
+    /// Backend id (`webSearch.provider`).
+    pub id: &'static str,
+    /// Human-readable name.
+    pub display_name: &'static str,
+    /// Env var checked when neither `apiKeyEnv` nor a stored key resolves.
+    pub default_api_key_env: &'static str,
+    /// API base URL unless `webSearch.baseUrl` overrides it.
+    pub default_base_url: &'static str,
+}
+
+/// The built-in web-search backends.
+pub const WEB_SEARCH_BACKENDS: &[WebSearchBackendInfo] = &[
+    WebSearchBackendInfo {
+        id: "tavily",
+        display_name: "Tavily",
+        default_api_key_env: "TAVILY_API_KEY",
+        default_base_url: "https://api.tavily.com",
+    },
+    WebSearchBackendInfo {
+        id: "brave",
+        display_name: "Brave Search",
+        default_api_key_env: "BRAVE_API_KEY",
+        default_base_url: "https://api.search.brave.com",
+    },
+];
+
+/// Look up a built-in backend by id (case-insensitive, whitespace trimmed).
+pub fn web_search_backend(id: &str) -> Option<&'static WebSearchBackendInfo> {
+    WEB_SEARCH_BACKENDS
+        .iter()
+        .find(|info| info.id.eq_ignore_ascii_case(id.trim()))
+}
+
 #[derive(Clone)]
 enum SearchBackend {
     Tavily { base_url: Url, api_key: String },
@@ -51,40 +89,40 @@ impl SearchBackend {
     /// env vars, the stored key (auth.json), or the backend's default env var,
     /// in that order. `Err` explains why the tool cannot be created.
     fn resolve(config: &WebSearchConfig, stored_key: Option<&str>) -> Result<Self, String> {
-        match config.provider.trim().to_ascii_lowercase().as_str() {
-            "tavily" => Self::new(
-                "tavily",
-                resolve_api_key(config, stored_key, "TAVILY_API_KEY")
-                    .ok_or("no API key: run /login tavily, or set TAVILY_API_KEY")?,
-                config,
-            ),
-            "brave" => Self::new(
-                "brave",
-                resolve_api_key(config, stored_key, "BRAVE_API_KEY")
-                    .ok_or("no API key: run /login brave, or set BRAVE_API_KEY")?,
-                config,
-            ),
-            other => Err(format!(
-                "unknown provider '{other}' (expected 'tavily' or 'brave')"
-            )),
-        }
+        let info = web_search_backend(&config.provider).ok_or_else(|| {
+            format!(
+                "unknown provider '{}' (expected 'tavily' or 'brave')",
+                config.provider.trim()
+            )
+        })?;
+        let api_key =
+            resolve_api_key(config, stored_key, info.default_api_key_env).ok_or_else(|| {
+                format!(
+                    "no API key: run /login {}, or set {}",
+                    info.id, info.default_api_key_env
+                )
+            })?;
+        Self::new(info, api_key, config)
     }
 
-    /// Build a backend for an explicit provider id and key (verification path).
-    fn new(provider: &str, api_key: String, config: &WebSearchConfig) -> Result<Self, String> {
+    /// Build a backend for an explicit registry record and key (the
+    /// verification path also uses this).
+    fn new(
+        info: &'static WebSearchBackendInfo,
+        api_key: String,
+        config: &WebSearchConfig,
+    ) -> Result<Self, String> {
         if api_key.trim().is_empty() {
-            return Err(format!("{provider}: API key is empty"));
+            return Err(format!("{}: API key is empty", info.id));
         }
         let policy = FetchPolicy {
             allow_private_addresses: config.allow_private_addresses,
         };
-        let default_base = match provider {
-            "brave" => "https://api.search.brave.com",
-            _ => "https://api.tavily.com",
-        };
-        let base_url =
-            resolve_base_url(config.base_url.as_deref().unwrap_or(default_base), policy)?;
-        Ok(match provider {
+        let base_url = resolve_base_url(
+            config.base_url.as_deref().unwrap_or(info.default_base_url),
+            policy,
+        )?;
+        Ok(match info.id {
             "brave" => Self::Brave { base_url, api_key },
             _ => Self::Tavily { base_url, api_key },
         })
@@ -230,8 +268,6 @@ fn parse_brave(body: &Value) -> Result<Vec<SearchHit>, String> {
         .collect())
 }
 
-/// Build the `web_search` tool. `Err` (missing key, unknown provider, bad base
-/// URL) should be reported by the caller and the tool left unregistered.
 /// Build the `web_search` tool. `stored_key` is the key saved by `/login`
 /// (auth.json); env vars from `apiKeyEnv` take precedence over it. `Err`
 /// (missing key, unknown provider, bad base URL) should be reported by the
@@ -299,8 +335,13 @@ pub fn create_web_search_tool(
 /// Auth failures (401/403) are reported as a rejected key; a probe costs one
 /// query on the backend's free tier.
 pub async fn verify_web_search_key(config: &WebSearchConfig, api_key: &str) -> Result<(), String> {
-    let provider = config.provider.trim().to_ascii_lowercase();
-    let backend = SearchBackend::new(&provider, api_key.to_string(), config)?;
+    let info = web_search_backend(&config.provider).ok_or_else(|| {
+        format!(
+            "unknown provider '{}' (expected 'tavily' or 'brave')",
+            config.provider.trim()
+        )
+    })?;
+    let backend = SearchBackend::new(info, api_key.to_string(), config)?;
     let policy = FetchPolicy {
         allow_private_addresses: config.allow_private_addresses,
     };
@@ -311,7 +352,7 @@ pub async fn verify_web_search_key(config: &WebSearchConfig, api_key: &str) -> R
     {
         Ok(_) => Ok(()),
         Err(e) if e.contains("401") || e.contains("403") => {
-            Err(format!("{} rejected the API key", backend.id()))
+            Err(format!("{} rejected the API key", info.display_name))
         }
         Err(e) => Err(e),
     }
@@ -362,6 +403,36 @@ mod tests {
         assert!(parse_brave(&body).is_err());
         let body: Value = serde_json::from_str(r#"{}"#).unwrap();
         assert!(parse_tavily(&body).is_err());
+    }
+
+    #[test]
+    fn entries_missing_required_fields_are_dropped() {
+        let body: Value = serde_json::from_str(
+            r#"{"results":[
+                {"title":"ok","url":"https://ok","content":"c"},
+                {"title":"no url"},
+                {"url":"https://no-title","content":"c"},
+                {"title":"null url","url":null}
+            ]}"#,
+        )
+        .unwrap();
+        let hits = parse_tavily(&body).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://ok");
+    }
+
+    #[test]
+    fn whitespace_only_keys_are_treated_as_missing() {
+        std::env::remove_var("LOOP_TEST_UNSET_SEARCH_KEY");
+        let config = WebSearchConfig {
+            provider: "tavily".into(),
+            ..Default::default()
+        };
+        assert!(
+            resolve_api_key(&config, Some("   "), "LOOP_TEST_UNSET_SEARCH_KEY").is_none(),
+            "a whitespace-only stored key must not count"
+        );
+        assert!(resolve_api_key(&config, Some("real-key"), "LOOP_TEST_UNSET_SEARCH_KEY").is_some());
     }
 
     #[test]

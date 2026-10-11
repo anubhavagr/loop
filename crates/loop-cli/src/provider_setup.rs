@@ -2,6 +2,7 @@
 //!
 //! Pure state machine; the app connects the resulting [`ProviderLoginRequest`].
 
+use loop_agent::harness::{web_search_backend, WebSearchBackendInfo, WEB_SEARCH_BACKENDS};
 use loop_ai::providers::{provider_preset, ProviderPreset, PROVIDER_PRESETS};
 use loop_app_core::config::providers::slugify;
 use loop_app_core::config::{validate_http_url, ProviderLoginRequest};
@@ -14,40 +15,22 @@ const CUSTOM_LABEL: &str = "Custom";
 const CUSTOM_DESCRIPTION: &str =
     "Any OpenAI-compatible API · Together, Groq, DeepSeek, vLLM, Ollama, LM Studio";
 
-/// A web-search backend offered by `/login` (key stored in auth.json).
-#[derive(Debug)]
-pub struct WebSearchEntry {
-    /// Backend id.
-    pub id: &'static str,
-    /// Display name.
-    pub name: &'static str,
-    /// Picker row description.
-    pub description: &'static str,
-    /// Where to get an API key.
-    pub key_url: &'static str,
+/// Picker-row copy for a web-search backend. Ids and names come from
+/// loop-agent's `WEB_SEARCH_BACKENDS` registry; only presentation lives here.
+fn backend_description(info: &WebSearchBackendInfo) -> &'static str {
+    match info.id {
+        "brave" => "Web search for the web_search tool · brave.com/search-api",
+        _ => "Web search for the web_search tool · free tier available",
+    }
 }
 
-/// Web-search backends the wizard can connect (matches loop-app-core's
-/// `WEB_SEARCH_PROVIDERS`).
-pub const WEB_SEARCH_ENTRIES: &[WebSearchEntry] = &[
-    WebSearchEntry {
-        id: "tavily",
-        name: "Tavily",
-        description: "Web search for the web_search tool · free tier available",
-        key_url: "https://app.tavily.com/home",
-    },
-    WebSearchEntry {
-        id: "brave",
-        name: "Brave Search",
-        description: "Web search for the web_search tool · free tier available",
-        key_url: "https://api-dashboard.search.brave.com/",
-    },
-];
-
-fn web_search_entry(id: &str) -> Option<&'static WebSearchEntry> {
-    WEB_SEARCH_ENTRIES
-        .iter()
-        .find(|entry| entry.id.eq_ignore_ascii_case(id))
+/// Where to get an API key for a backend (shown in the key prompt).
+fn backend_key_url(info: &WebSearchBackendInfo) -> &'static str {
+    match info.id {
+        "tavily" => "https://app.tavily.com/home",
+        "brave" => "https://api-dashboard.search.brave.com/",
+        _ => "",
+    }
 }
 
 /// Which provider the key is for.
@@ -56,7 +39,7 @@ pub enum LoginTarget {
     /// A built-in provider.
     Preset(&'static ProviderPreset),
     /// A web-search backend.
-    WebSearch(&'static WebSearchEntry),
+    WebSearch(&'static WebSearchBackendInfo),
     /// A custom OpenAI-compatible endpoint.
     Custom {
         /// Display name.
@@ -123,9 +106,9 @@ impl ProviderSetup {
                         target: LoginTarget::Preset(preset),
                     });
                 }
-                if let Some(entry) = web_search_entry(p) {
+                if let Some(info) = web_search_backend(p) {
                     return Ok(Self::ApiKey {
-                        target: LoginTarget::WebSearch(entry),
+                        target: LoginTarget::WebSearch(info),
                     });
                 }
                 Err(format!("unknown provider `{p}`. {}", login_usage()))
@@ -140,8 +123,8 @@ impl ProviderSetup {
                 Some(preset) => LoginTarget::Preset(preset),
                 None => return Self::Choose { selected: 0 },
             },
-            ProviderLoginRequest::WebSearch { id, .. } => match web_search_entry(id) {
-                Some(entry) => LoginTarget::WebSearch(entry),
+            ProviderLoginRequest::WebSearch { id, .. } => match web_search_backend(id) {
+                Some(info) => LoginTarget::WebSearch(info),
                 None => return Self::Choose { selected: 0 },
             },
             ProviderLoginRequest::Custom { name, base_url, .. } => LoginTarget::Custom {
@@ -153,7 +136,7 @@ impl ProviderSetup {
     }
 
     fn row_count() -> usize {
-        PROVIDER_PRESETS.len() + WEB_SEARCH_ENTRIES.len() + 1
+        PROVIDER_PRESETS.len() + WEB_SEARCH_BACKENDS.len() + 1
     }
 
     /// Submit the input line at the current step.
@@ -165,9 +148,9 @@ impl ProviderSetup {
                     Some(preset) => Self::ApiKey {
                         target: LoginTarget::Preset(preset),
                     },
-                    None => match WEB_SEARCH_ENTRIES.get(selected - PROVIDER_PRESETS.len()) {
-                        Some(entry) => Self::ApiKey {
-                            target: LoginTarget::WebSearch(entry),
+                    None => match WEB_SEARCH_BACKENDS.get(selected - PROVIDER_PRESETS.len()) {
+                        Some(info) => Self::ApiKey {
+                            target: LoginTarget::WebSearch(info),
                         },
                         None => Self::CustomName,
                     },
@@ -217,15 +200,15 @@ impl ProviderSetup {
                 api_key: value,
             }),
             Self::ApiKey {
-                target: LoginTarget::WebSearch(entry),
+                target: LoginTarget::WebSearch(info),
             } if value.is_empty() => Self::ApiKey {
-                target: LoginTarget::WebSearch(entry),
+                target: LoginTarget::WebSearch(info),
             }
-            .retry(&format!("{} needs an API key", entry.name)),
+            .retry(&format!("{} needs an API key", info.display_name)),
             Self::ApiKey {
-                target: LoginTarget::WebSearch(entry),
+                target: LoginTarget::WebSearch(info),
             } => Transition::Done(ProviderLoginRequest::WebSearch {
-                id: entry.id.into(),
+                id: info.id.into(),
                 api_key: value,
             }),
             Self::ApiKey {
@@ -251,7 +234,7 @@ pub fn login_usage() -> String {
     let ids: Vec<&str> = PROVIDER_PRESETS
         .iter()
         .map(|p| p.id)
-        .chain(WEB_SEARCH_ENTRIES.iter().map(|e| e.id))
+        .chain(WEB_SEARCH_BACKENDS.iter().map(|info| info.id))
         .chain([CUSTOM_PROVIDER])
         .collect();
     format!("Usage: /login [{}]", ids.join("|"))
@@ -267,8 +250,8 @@ impl WizardView for ProviderSetup {
                 target: LoginTarget::Preset(preset),
             } => format!("Connect {}", preset.name),
             Self::ApiKey {
-                target: LoginTarget::WebSearch(entry),
-            } => format!("Connect {}", entry.name),
+                target: LoginTarget::WebSearch(info),
+            } => format!("Connect {}", info.display_name),
             Self::ApiKey {
                 target: LoginTarget::Custom { name, .. },
             } => format!("Connect {name} · step 3 of 3"),
@@ -291,10 +274,11 @@ impl WizardView for ProviderSetup {
                 preset.name, preset.key_hint, preset.key_cta, preset.key_url
             ),
             Self::ApiKey {
-                target: LoginTarget::WebSearch(entry),
+                target: LoginTarget::WebSearch(info),
             } => format!(
                 "Paste your {} API key — input stays hidden · get one at {} · powers the web_search tool",
-                entry.name, entry.key_url
+                info.display_name,
+                backend_key_url(info)
             ),
             Self::ApiKey {
                 target: LoginTarget::Custom { name, .. },
@@ -324,7 +308,11 @@ impl WizardView for ProviderSetup {
                 PROVIDER_PRESETS
                     .iter()
                     .map(|p| (p.name, p.description))
-                    .chain(WEB_SEARCH_ENTRIES.iter().map(|e| (e.name, e.description)))
+                    .chain(
+                        WEB_SEARCH_BACKENDS
+                            .iter()
+                            .map(|info| (info.display_name, backend_description(info))),
+                    )
                     .chain([(CUSTOM_LABEL, CUSTOM_DESCRIPTION)])
                     .collect(),
                 *selected,

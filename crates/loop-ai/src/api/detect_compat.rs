@@ -90,6 +90,11 @@ pub fn detect_compat(base_url: &str) -> OpenAICompletionsCompat {
     }
 }
 
+/// Explicit override → URL-detected default → `fallback`.
+fn pick<T>(overridden: Option<T>, detected: Option<T>, fallback: T) -> T {
+    overridden.or(detected).unwrap_or(fallback)
+}
+
 /// Merge URL-detected defaults with explicit model overrides.
 pub fn resolve_compat(
     model_base_url: &str,
@@ -99,50 +104,54 @@ pub fn resolve_compat(
     let o = override_compat.cloned().unwrap_or_default();
 
     ResolvedOpenAICompletionsCompat {
-        supports_store: o
-            .supports_store
-            .or(detected.supports_store)
-            .unwrap_or(false),
-        supports_metadata: o
-            .supports_metadata
-            .or(detected.supports_metadata)
-            .unwrap_or(false),
-        supports_developer_role: o
-            .supports_developer_role
-            .or(detected.supports_developer_role)
-            .unwrap_or(false),
-        supports_reasoning_effort: o
-            .supports_reasoning_effort
-            .or(detected.supports_reasoning_effort)
-            .unwrap_or(false),
-        supports_usage_in_streaming: o
-            .supports_usage_in_streaming
-            .or(detected.supports_usage_in_streaming)
-            .unwrap_or(true),
-        supports_finish_reason: o
-            .supports_finish_reason
-            .or(detected.supports_finish_reason)
-            .unwrap_or(true),
-        max_tokens_field: o
-            .max_tokens_field
-            .or(detected.max_tokens_field)
-            .unwrap_or(MaxTokensField::MaxTokens),
-        requires_tool_result_name: o
-            .requires_tool_result_name
-            .or(detected.requires_tool_result_name)
-            .unwrap_or(false),
-        requires_assistant_after_tool_result: o
-            .requires_assistant_after_tool_result
-            .or(detected.requires_assistant_after_tool_result)
-            .unwrap_or(false),
-        requires_thinking_as_text: o
-            .requires_thinking_as_text
-            .or(detected.requires_thinking_as_text)
-            .unwrap_or(false),
-        thinking_format: o
-            .thinking_format
-            .or(detected.thinking_format)
-            .unwrap_or(ThinkingFormat::Openai),
+        supports_store: pick(o.supports_store, detected.supports_store, false),
+        supports_metadata: pick(o.supports_metadata, detected.supports_metadata, false),
+        supports_developer_role: pick(
+            o.supports_developer_role,
+            detected.supports_developer_role,
+            false,
+        ),
+        supports_reasoning_effort: pick(
+            o.supports_reasoning_effort,
+            detected.supports_reasoning_effort,
+            false,
+        ),
+        supports_usage_in_streaming: pick(
+            o.supports_usage_in_streaming,
+            detected.supports_usage_in_streaming,
+            true,
+        ),
+        supports_finish_reason: pick(
+            o.supports_finish_reason,
+            detected.supports_finish_reason,
+            true,
+        ),
+        max_tokens_field: pick(
+            o.max_tokens_field,
+            detected.max_tokens_field,
+            MaxTokensField::MaxTokens,
+        ),
+        requires_tool_result_name: pick(
+            o.requires_tool_result_name,
+            detected.requires_tool_result_name,
+            false,
+        ),
+        requires_assistant_after_tool_result: pick(
+            o.requires_assistant_after_tool_result,
+            detected.requires_assistant_after_tool_result,
+            false,
+        ),
+        requires_thinking_as_text: pick(
+            o.requires_thinking_as_text,
+            detected.requires_thinking_as_text,
+            false,
+        ),
+        thinking_format: pick(
+            o.thinking_format,
+            detected.thinking_format,
+            ThinkingFormat::Openai,
+        ),
+        // No fallback: `None` means "no session affinity".
         session_affinity_format: o
             .session_affinity_format
             .or(detected.session_affinity_format),

@@ -170,22 +170,17 @@ impl ProviderLoginRequest {
     }
 }
 
-/// Web-search backend ids accepted by `/login`.
-pub const WEB_SEARCH_PROVIDERS: &[&str] = &["tavily", "brave"];
-
-/// Whether `id` names a built-in web-search backend.
+/// Whether `id` names a built-in web-search backend (see loop-agent's
+/// `WEB_SEARCH_BACKENDS` registry — the single source of truth).
 pub fn is_web_search_provider(id: &str) -> bool {
-    let id = id.trim().to_ascii_lowercase();
-    WEB_SEARCH_PROVIDERS.contains(&id.as_str())
+    loop_agent::harness::web_search_backend(id).is_some()
 }
 
 /// Display name for a web-search backend id.
 pub fn web_search_display_name(id: &str) -> String {
-    match id.trim().to_ascii_lowercase().as_str() {
-        "tavily" => "Tavily".into(),
-        "brave" => "Brave Search".into(),
-        other => other.into(),
-    }
+    loop_agent::harness::web_search_backend(id)
+        .map(|info| info.display_name.to_string())
+        .unwrap_or_else(|| id.trim().to_string())
 }
 
 /// `"My Gateway!"` → `"my-gateway"`.

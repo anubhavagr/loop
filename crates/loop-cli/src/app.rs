@@ -30,6 +30,7 @@ use crate::commands::TracingCommand;
 use crate::commands::{self, AutocompleteEntry, CommandEffect, McpCommand, SkillsCommand};
 #[cfg(feature = "telemetry")]
 use crate::config::describe_tracing_status;
+use crate::config::ProviderLoginRequest;
 use crate::keybindings::{
     hotkey_help, multiline_paste_text, normalize_pasted_text, paste_burst_pending,
     pasted_single_line, Action,
@@ -52,7 +53,6 @@ use crate::tui::{
     render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus, ChatItem, CommandHistory,
     FileEntry, FooterOpts, InputBuffer, McpServerListing, PickerRow, PickerView, FOOTER_HEIGHT,
 };
-use crate::config::ProviderLoginRequest;
 use crate::{build_tools, CliRuntime};
 
 #[allow(

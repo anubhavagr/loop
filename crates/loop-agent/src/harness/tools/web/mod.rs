@@ -9,14 +9,18 @@
 //!
 //! - `web_fetch` is always available; `webFetch.allowPrivateAddresses` opts a
 //!   deployment into intranet mirrors (default: fail closed).
-//! - `web_search` needs a backend config (`webSearch` in settings.json) and an
-//!   API key in the environment; see [`search`].
+//! - `web_search` needs a backend config (`webSearch` in settings.json); its
+//!   API key comes from `/login tavily|brave` (auth.json), `apiKeyEnv` env
+//!   vars, or the backend's default env var. See [`search`].
 
 mod guard;
 mod html;
 mod search;
 
-pub use search::{create_web_search_tool, verify_web_search_key, WebSearchConfig};
+pub use search::{
+    create_web_search_tool, verify_web_search_key, web_search_backend, WebSearchBackendInfo,
+    WebSearchConfig, WEB_SEARCH_BACKENDS,
+};
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -59,45 +63,33 @@ impl WebFetchConfig {
     }
 }
 
-fn strict_client() -> Result<reqwest::Client, String> {
-    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| build_client(FetchPolicy::default()))
-        .clone()
-        .ok_or_else(|| "HTTP client init failed".to_string())
-}
-
-fn lenient_client() -> Result<reqwest::Client, String> {
-    static CLIENT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
-    CLIENT
-        .get_or_init(|| {
-            build_client(FetchPolicy {
-                allow_private_addresses: true,
-            })
-        })
-        .clone()
-        .ok_or_else(|| "HTTP client init failed".to_string())
-}
-
-/// One pooled client per policy for the whole process.
+/// One pooled client per policy, shared for the whole process.
 fn shared_client(policy: FetchPolicy) -> Result<reqwest::Client, String> {
-    if policy.allow_private_addresses {
-        lenient_client()
+    static STRICT: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    static PRIVATE_HOSTS_ALLOWED: OnceLock<Option<reqwest::Client>> = OnceLock::new();
+    let cell = if policy.allow_private_addresses {
+        &PRIVATE_HOSTS_ALLOWED
     } else {
-        strict_client()
-    }
+        &STRICT
+    };
+    cell.get_or_init(|| build_client(policy))
+        .clone()
+        .ok_or_else(|| "HTTP client init failed".to_string())
 }
 
 fn build_client(policy: FetchPolicy) -> Option<reqwest::Client> {
-    reqwest::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
         // Redirects are followed (and re-validated) by `fetch_url`.
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("loop/", env!("CARGO_PKG_VERSION")))
         .dns_resolver(std::sync::Arc::new(guard::GuardResolver::new(policy)))
-        .build()
-        .ok()
+        .build();
+    if let Err(error) = &client {
+        tracing::error!("web tools: HTTP client init failed: {error}");
+    }
+    client.ok()
 }
 
 /// Build the `web_fetch` tool. `Err` only covers HTTP client init failure.
@@ -116,10 +108,9 @@ pub fn create_web_fetch_tool(config: WebFetchConfig) -> Result<AgentTool, String
         ),
         move |_id, args, cancel, _on_update| {
             let client = client.clone();
-            let policy = config.policy();
             async move {
-                let raw = arg_str(&args, "url")?;
-                fetch_url(&client, &raw, policy, cancel.as_ref()).await
+                let raw_url = arg_str(&args, "url")?;
+                fetch_url(&client, &raw_url, policy, cancel.as_ref()).await
             }
         },
     ))
@@ -128,13 +119,14 @@ pub fn create_web_fetch_tool(config: WebFetchConfig) -> Result<AgentTool, String
 /// Fetch with validated redirects and a capped, truncated body.
 async fn fetch_url(
     client: &reqwest::Client,
-    raw: &str,
+    raw_url: &str,
     policy: FetchPolicy,
     cancel: Option<&CancellationToken>,
 ) -> Result<AgentToolResult, String> {
-    let original = Url::parse(raw).map_err(|e| format!("invalid URL '{raw}': {e}"))?;
-    let mut url = original.clone();
-    let mut redirected = false;
+    let mut url = Url::parse(raw_url).map_err(|e| format!("invalid URL '{raw_url}': {e}"))?;
+    // Only remembered when a redirect actually happens (the common fetch does
+    // not redirect, and `Url` clones are heap allocations).
+    let mut redirected_from: Option<Url> = None;
 
     for _ in 0..=MAX_REDIRECTS {
         validate_request_url(&url, policy)?;
@@ -159,26 +151,34 @@ async fn fetch_url(
             else {
                 return Err(format!("redirect without Location from {}", url.as_str()));
             };
-            url = url
+            let next = url
                 .join(location)
                 .map_err(|e| format!("invalid redirect location '{location}': {e}"))?;
-            redirected = true;
+            redirected_from.get_or_insert_with(|| url.clone());
+            url = next;
             continue;
         }
         if !status.is_success() {
             return Err(format!("HTTP {} from {}", status.as_u16(), url.as_str()));
         }
 
-        let content_type = response
+        // An absent or empty header degrades to text/plain rather than a
+        // confusing "unsupported content type ''".
+        let header_content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("text/plain")
+            .unwrap_or("")
             .split(';')
             .next()
-            .unwrap_or("text/plain")
+            .unwrap_or("")
             .trim()
             .to_ascii_lowercase();
+        let content_type: &str = if header_content_type.is_empty() {
+            "text/plain"
+        } else {
+            header_content_type.as_str()
+        };
         let textual = content_type.starts_with("text/")
             || content_type.contains("json")
             || content_type.contains("xml")
@@ -191,6 +191,10 @@ async fn fetch_url(
 
         let (bytes, download_truncated) = read_capped(response, cancel).await?;
         let mut text = String::from_utf8_lossy(&bytes).into_owned();
+        // Some servers prefix a UTF-8 byte-order mark; it is noise to a model.
+        if let Some(without_bom) = text.strip_prefix('\u{feff}') {
+            text = without_bom.to_string();
+        }
         if content_type.contains("html") {
             text = html::html_to_text(&text);
         }
@@ -202,7 +206,7 @@ async fn fetch_url(
             "bytes": bytes.len(),
             "truncated": truncated || download_truncated,
         });
-        if redirected {
+        if let Some(original) = &redirected_from {
             details["redirectedFrom"] = json!(original.as_str());
         }
         return Ok(AgentToolResult {
@@ -228,7 +232,14 @@ async fn read_capped(
     mut response: reqwest::Response,
     cancel: Option<&CancellationToken>,
 ) -> Result<(Vec<u8>, bool), String> {
-    let mut body = Vec::new();
+    // Pre-size from Content-Length (capped) to avoid growth reallocations.
+    let expected = response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(8 * 1024);
+    let mut body = Vec::with_capacity(expected.min(MAX_DOWNLOAD_BYTES));
     while let Some(chunk) = response
         .chunk()
         .await

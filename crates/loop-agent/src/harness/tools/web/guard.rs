@@ -55,7 +55,6 @@ fn is_private_ipv4(v: Ipv4Addr) -> bool {
         || o[0] == 0 // "this network"
         || o[0] == 10 // private
         || (o[0] == 100 && o[1] & 0xc0 == 64) // CGNAT 100.64/10
-        || (o[0] == 127) // loopback (is_loopback covers it; keep explicit)
         || (o[0] == 169 && o[1] == 254) // link-local (cloud metadata)
         || (o[0] == 172 && o[1] & 0xf0 == 16) // private
         || (o[0] == 192 && o[1] == 168) // private
@@ -63,7 +62,7 @@ fn is_private_ipv4(v: Ipv4Addr) -> bool {
         || (o[0] == 198 && matches!(o[1], 18 | 19)) // benchmark
         || (o[0] == 198 && o[1] == 51 && o[2] == 100) // TEST-NET-2
         || (o[0] == 203 && o[1] == 0 && o[2] == 113) // TEST-NET-3
-        || o[0] >= 240 // reserved (incl. broadcast)
+        || o[0] >= 240 // reserved
 }
 
 fn is_private_ipv6(v: Ipv6Addr) -> bool {
@@ -92,12 +91,15 @@ pub fn validate_request_url(url: &Url, policy: FetchPolicy) -> Result<(), String
     if !url.username().is_empty() || url.password().is_some() {
         return Err("URLs with embedded credentials are not allowed".into());
     }
-    // `host_str` serializes IPv6 literals with brackets; strip them so the
+    // `host_str` serializes IPv6 literals with brackets; strip one pair so the
     // `IpAddr` parse recognizes both families.
     let Some(host) = url.host_str() else {
         return Err("URL has no host".into());
     };
-    let literal = host.trim_start_matches('[').trim_end_matches(']');
+    let literal = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     if let Ok(ip) = literal.parse::<IpAddr>() {
         if !policy.permits_addr(ip) {
             return Err(format!("refusing to fetch private address {ip}"));
@@ -160,7 +162,7 @@ impl Resolve for GuardResolver {
 mod tests {
     use super::*;
 
-    fn check(ip: &str) -> bool {
+    fn is_private(ip: &str) -> bool {
         is_private_address(ip.parse().unwrap())
     }
 
@@ -190,7 +192,7 @@ mod tests {
             "240.0.0.1",
             "255.255.255.255",
         ] {
-            assert!(check(blocked), "{blocked} should be private");
+            assert!(is_private(blocked), "{blocked} should be private");
         }
         for public in [
             "1.1.1.1",
@@ -208,7 +210,7 @@ mod tests {
             "203.0.114.1",
             "223.255.255.1",
         ] {
-            assert!(!check(public), "{public} should be public");
+            assert!(!is_private(public), "{public} should be public");
         }
     }
 
@@ -225,14 +227,14 @@ mod tests {
             "ff02::1",
             "2001:db8::1",
         ] {
-            assert!(check(blocked), "{blocked} should be private");
+            assert!(is_private(blocked), "{blocked} should be private");
         }
         for public in [
             "2606:4700:4700::1111",
             "2a00:1450:4001::1",
             "::ffff:8.8.8.8",
         ] {
-            assert!(!check(public), "{public} should be public");
+            assert!(!is_private(public), "{public} should be public");
         }
     }
 
@@ -261,16 +263,18 @@ mod tests {
             "http://[::ffff:10.0.0.1]/",
             "http://169.254.169.254/latest/meta-data",
         ] {
-            let err = validate_request_url(&url(blocked), strict)
-                .expect_err("{blocked} should be rejected");
             assert!(
-                !err.contains("scheme")
-                    || blocked.starts_with("ftp")
-                    || blocked.starts_with("file"),
-                "unexpected error for {blocked}: {err}"
+                validate_request_url(&url(blocked), strict).is_err(),
+                "{blocked} should be rejected"
             );
         }
-        // Lenient policy allows intranet targets.
+        // Denial reasons are distinguishable for the two guard paths.
+        let err = validate_request_url(&url("http://192.168.1.10/"), strict).unwrap_err();
+        assert!(err.contains("private address"), "got: {err}");
+        let err = validate_request_url(&url("http://localhost/"), strict).unwrap_err();
+        assert!(err.contains("localhost"), "got: {err}");
+
+        // Lenient policy allows intranet targets …
         for allowed in [
             "http://localhost/",
             "http://127.0.0.1/",
@@ -279,7 +283,9 @@ mod tests {
         ] {
             assert!(validate_request_url(&url(allowed), lenient).is_ok());
         }
-        // Lenient does not weaken scheme/credential rules.
+        // … including via `permits_addr` directly.
+        assert!(lenient.permits_addr("10.0.0.1".parse().unwrap()));
+        // … but never weakens scheme/credential rules.
         assert!(validate_request_url(&url("ftp://example.com"), lenient).is_err());
         assert!(validate_request_url(&url("https://u:p@example.com"), lenient).is_err());
     }

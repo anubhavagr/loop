@@ -16,10 +16,7 @@ use crate::harness::utils::{execute_shell_with_capture, truncate_head, DEFAULT_M
 use crate::types::{AgentTool, AgentToolResult};
 use loop_ai::{ImageContent, TextContent, ToolResultContent};
 
-pub(crate) fn schema_object(
-    properties: serde_json::Value,
-    required: &[&str],
-) -> serde_json::Value {
+pub(crate) fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
     json!({
         "type": "object",
         "properties": properties,

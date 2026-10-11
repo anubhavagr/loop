@@ -48,155 +48,206 @@ const BLOCK_ELEMENTS: &[&str] = &[
 ];
 
 /// Convert an HTML document to readable plain text.
+///
+/// Scanning jumps between markup via substring search (memchr-backed) and
+/// copies text runs wholesale, so plain-text bytes never go through per-char
+/// dispatch — fetched pages are up to the 2 MB download cap.
 pub fn html_to_text(input: &str) -> String {
-    let mut out = String::with_capacity(input.len() / 2);
-    let mut chars = input.char_indices().peekable();
-    let mut skip_until: Option<String> = None; // closing tag of a dropped subtree
+    let mut text = String::with_capacity(input.len() / 2);
+    let mut rest = input;
     let mut at_line_start = true;
 
-    while let Some((i, c)) = chars.next() {
-        if let Some(close) = &skip_until {
-            // Inside a dropped subtree: only look for its closing tag.
-            if c == '<' && closing_tag_matches(input, i, close) {
-                skip_until = None;
-                skip_tag(&mut chars);
+    'page: while let Some(mark) = rest.find(['<', '&']) {
+        let (chunk, tail) = rest.split_at(mark);
+        // Bulk-copy the text run before the markup.
+        if !chunk.is_empty() {
+            text.push_str(chunk);
+            if chunk.chars().any(|c| !c.is_whitespace()) {
+                at_line_start = false;
+            }
+        }
+
+        if let Some(after_ampersand) = tail.strip_prefix('&') {
+            match decode_entity(tail) {
+                Some((decoded, consumed)) => {
+                    text.push(decoded);
+                    at_line_start = false;
+                    rest = &tail[consumed..];
+                }
+                None => {
+                    text.push('&');
+                    rest = after_ampersand;
+                }
             }
             continue;
         }
-        match c {
-            '<' if input[i..].starts_with("<!--") => {
-                // Comment: drop up to `-->`.
-                match input[i + 4..].find("-->") {
-                    Some(end) => {
-                        let resume = i + 4 + end + 3;
-                        while chars.next().is_some_and(|(j, _)| j < resume - 1) {}
-                    }
-                    None => break,
+
+        if tail.starts_with("<!--") {
+            // Comment: drop up to `-->`; an unterminated comment drops the
+            // rest of the input.
+            match tail.find("-->") {
+                Some(end) => rest = &tail[end + 3..],
+                None => {
+                    rest = "";
+                    break;
                 }
             }
-            '<' => {
-                let Some((name, is_close, consumed_to)) = read_tag(input, i) else {
-                    continue;
-                };
-                let name = name.to_ascii_lowercase();
-                // Advance the iterator past the tag.
-                while chars.next().is_some_and(|(j, _)| j < consumed_to - 1) {}
-                if SKIP_ELEMENTS.contains(&name.as_str()) {
-                    if !is_close {
-                        skip_until = Some(format!("/{name}"));
-                    }
-                    continue;
-                }
-                if name == "br" && !is_close {
-                    // `<br><br>` is a paragraph gap; keep every break.
-                    out.push('\n');
-                    at_line_start = true;
-                } else if name == "li" && !is_close {
-                    if !at_line_start {
-                        out.push('\n');
-                    }
-                    out.push_str("- ");
-                    at_line_start = false;
-                } else if BLOCK_ELEMENTS.contains(&name.as_str()) {
-                    // Runs of block boundaries collapse to one blank line later.
-                    out.push('\n');
-                    at_line_start = true;
-                }
+            continue;
+        }
+
+        let Some(tag) = ParsedTag::parse(tail) else {
+            // Stray `<` (not a tag): keep it as literal text.
+            text.push('<');
+            at_line_start = false;
+            rest = &tail[1..];
+            continue;
+        };
+
+        if matches_any(tag.name, SKIP_ELEMENTS) {
+            if tag.is_closing {
+                rest = &tail[tag.end..];
+                continue;
             }
-            '&' => {
-                if let Some(decoded) = decode_entity(&input[i..]) {
-                    out.push_str(&decoded);
-                    let consumed = input[i..].find(';').expect("entity ends with ';'") + 1;
-                    while chars.next().is_some_and(|(j, _)| j < i + consumed - 1) {}
-                    at_line_start = false;
-                } else {
-                    out.push('&');
-                }
-            }
-            _ => {
-                out.push(c);
-                if !c.is_whitespace() {
-                    at_line_start = false;
+            // Drop the whole subtree: jump to its closing tag. An
+            // unterminated element drops the rest of the input.
+            let mut scan = &tail[tag.end..];
+            loop {
+                match scan.find('<') {
+                    None => {
+                        rest = "";
+                        break 'page;
+                    }
+                    Some(position) => {
+                        if is_closing_tag(&scan[position..], tag.name) {
+                            match scan[position..].find('>') {
+                                Some(end) => {
+                                    rest = &scan[position + end + 1..];
+                                    continue 'page;
+                                }
+                                None => {
+                                    rest = "";
+                                    break 'page;
+                                }
+                            }
+                        }
+                        scan = &scan[position + 1..];
+                    }
                 }
             }
         }
-    }
-    collapse_whitespace(&out)
-}
 
-/// Consume through the `>` of the current tag.
-fn skip_tag(chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>) {
-    while chars.next().is_some_and(|(_, c)| c != '>') {}
-}
-
-/// Whether the tag starting at `i` is `</{close}>` (case-insensitive).
-fn closing_tag_matches(input: &str, i: usize, close: &str) -> bool {
-    let rest = &input[i..];
-    let Some(tag_body) = rest.strip_prefix("</") else {
-        return false;
-    };
-    let name_end = tag_body
-        .find(|c: char| c == '>' || c.is_whitespace())
-        .unwrap_or(tag_body.len());
-    tag_body[..name_end].eq_ignore_ascii_case(close.trim_start_matches('/'))
-}
-
-/// Read the tag starting at `<` index `i`.
-/// Returns `(name, is_closing, index_after_tag)`.
-fn read_tag(input: &str, i: usize) -> Option<(String, bool, usize)> {
-    let rest = &input[i + 1..];
-    let is_close = rest.starts_with('/');
-    let body = rest.trim_start_matches('/');
-    let name_len = body
-        .find(|c: char| c == '>' || c == '/' || c.is_whitespace())
-        .unwrap_or(body.len());
-    if name_len == 0 {
-        return None;
-    }
-    let name: String = body[..name_len]
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect();
-    if name.is_empty() {
-        return None;
-    }
-    // Find the end of the tag, tolerating quoted attribute values containing `>`.
-    let mut quote: Option<char> = None;
-    let end = rest.char_indices().find_map(|(j, c)| match quote {
-        Some(q) if c == q => {
-            quote = None;
-            None
+        if tag.name.eq_ignore_ascii_case("br") && !tag.is_closing {
+            // `<br><br>` is a paragraph gap; keep every break.
+            text.push('\n');
+            at_line_start = true;
+        } else if tag.name.eq_ignore_ascii_case("li") && !tag.is_closing {
+            if !at_line_start {
+                text.push('\n');
+            }
+            text.push_str("- ");
+            at_line_start = false;
+        } else if matches_any(tag.name, BLOCK_ELEMENTS) {
+            // Runs of block boundaries collapse to one blank line later.
+            text.push('\n');
+            at_line_start = true;
         }
-        Some(_) => None,
-        None => match c {
-            '"' | '\'' => {
-                quote = Some(c);
+        rest = &tail[tag.end..];
+    }
+    text.push_str(rest);
+    collapse_whitespace(&text)
+}
+
+/// Whether `name` matches any element in `list`, case-insensitively.
+fn matches_any(name: &str, list: &[&str]) -> bool {
+    list.iter()
+        .any(|element| element.eq_ignore_ascii_case(name))
+}
+
+/// A tag parsed from a slice that starts at its `<`.
+struct ParsedTag<'a> {
+    /// Element name as written (`div`, `BR`, …); matching is case-insensitive.
+    name: &'a str,
+    /// `</name>` rather than `<name>`.
+    is_closing: bool,
+    /// Byte index just past the closing `>`, relative to the slice start.
+    end: usize,
+}
+
+impl<'a> ParsedTag<'a> {
+    /// Parse the tag starting at the slice's leading `<`; `None` for stray `<`
+    /// sequences that do not open a real tag (e.g. a lone `<` or `<!`).
+    fn parse(starting_at_open_bracket: &'a str) -> Option<Self> {
+        let rest = &starting_at_open_bracket[1..];
+        let is_closing = rest.starts_with('/');
+        let body = rest.trim_start_matches('/');
+        let name_len = body
+            .find(|c: char| c == '>' || c == '/' || c.is_whitespace())
+            .unwrap_or(body.len());
+        let name = &body[..name_len];
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return None;
+        }
+        // Find the end of the tag, tolerating quoted attribute values
+        // containing `>`.
+        let mut quote: Option<char> = None;
+        let end = rest.char_indices().find_map(|(j, c)| match quote {
+            Some(q) if c == q => {
+                quote = None;
                 None
             }
-            '>' => Some(i + 1 + j + 1),
-            _ => None,
-        },
-    })?;
-    Some((name, is_close, end))
+            Some(_) => None,
+            None => match c {
+                '"' | '\'' => {
+                    quote = Some(c);
+                    None
+                }
+                '>' => Some(j + 2), // past `>`, relative to the leading `<`
+                _ => None,
+            },
+        })?;
+        Some(Self {
+            name,
+            is_closing,
+            end,
+        })
+    }
+}
+
+/// Whether `candidate`, starting at its `<`, is `</{name}>` (case-insensitive).
+fn is_closing_tag(candidate: &str, name: &str) -> bool {
+    let Some(body) = candidate.strip_prefix("</") else {
+        return false;
+    };
+    let name_end = body
+        .find(|c: char| c == '>' || c.is_whitespace())
+        .unwrap_or(body.len());
+    body[..name_end].eq_ignore_ascii_case(name)
 }
 
 fn collapse_whitespace(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut pending_space = false;
     let mut newlines = 0usize;
+    let mut content_end = 0usize; // byte length of out ignoring trailing whitespace
     for c in text.chars() {
         match c {
             '\n' => {
                 pending_space = false;
                 newlines += 1;
             }
-            c if c == ' ' || c == '\t' || c == '\r' => {
+            ' ' | '\t' | '\r' => {
                 // Skip indentation after a newline and at the very start.
                 if !out.is_empty() && !out.ends_with('\n') {
                     pending_space = true;
                 }
             }
             _ => {
+                if out.is_empty() {
+                    // Drop leading breaks/indentation without allocating
+                    // a trimmed copy afterwards.
+                    newlines = 0;
+                    pending_space = false;
+                }
                 if newlines > 0 {
                     out.push_str(if newlines >= 2 { "\n\n" } else { "\n" });
                     newlines = 0;
@@ -205,14 +256,19 @@ fn collapse_whitespace(text: &str) -> String {
                 }
                 pending_space = false;
                 out.push(c);
+                content_end = out.len();
             }
         }
     }
-    out.trim().to_string()
+    out.truncate(content_end);
+    out
 }
 
-/// Decode one HTML entity at the start of `s` (which begins with `&`).
-fn decode_entity(s: &str) -> Option<String> {
+/// Decode one HTML entity at the start of `s` (which begins with `&`),
+/// returning the character and the bytes it consumed (through `;`).
+/// Numeric references that resolve to control characters are rejected (they
+/// would inject NULs / escape sequences into the output).
+fn decode_entity(s: &str) -> Option<(char, usize)> {
     let end = s.find(';')?;
     if end == 0 || end > 10 {
         return None;
@@ -224,7 +280,8 @@ fn decode_entity(s: &str) -> Option<String> {
         } else {
             num.parse::<u32>().ok()?
         };
-        return char::from_u32(code).map(String::from);
+        let decoded = char::from_u32(code).filter(|c| !c.is_control())?;
+        return Some((decoded, end + 1));
     }
     let decoded = match body {
         "amp" => '&',
@@ -248,7 +305,7 @@ fn decode_entity(s: &str) -> Option<String> {
         "raquo" => '»',
         _ => return None,
     };
-    Some(decoded.to_string())
+    Some((decoded, end + 1))
 }
 
 #[cfg(test)]
@@ -300,5 +357,53 @@ mod tests {
     #[test]
     fn plain_text_passes_through() {
         assert_eq!(html_to_text("just text & nothing"), "just text & nothing");
+    }
+
+    #[test]
+    fn tag_names_are_case_insensitive() {
+        let text = html_to_text("<DIV>One</DIV><P>Two</P><BR>");
+        assert_eq!(text, "One\n\nTwo");
+    }
+
+    #[test]
+    fn self_closing_and_quoted_angle_brackets() {
+        // `>` inside a quoted attribute must not end the tag.
+        let text = html_to_text("<p><a href=\"a>b\" title='c>d'>link</a><br/>tail</p>");
+        assert_eq!(text, "link\ntail");
+    }
+
+    #[test]
+    fn script_with_attributes_is_skipped() {
+        let html = r#"<p>keep</p><script type="text/javascript" defer>var a = "</p>";</script><p>also keep</p>"#;
+        let text = html_to_text(html);
+        assert_eq!(text, "keep\n\nalso keep");
+    }
+
+    #[test]
+    fn stray_angle_brackets_do_not_crash() {
+        // Inline text before a block boundary gets a single break; a blank
+        // line only appears between two block boundaries.
+        assert_eq!(html_to_text("a < b < 3 <p>c</p>"), "a < b < 3\nc");
+        assert_eq!(html_to_text(""), "");
+        assert_eq!(html_to_text("<"), "<");
+        assert_eq!(html_to_text("<!-- unclosed comment"), "");
+    }
+
+    #[test]
+    fn numeric_entity_edges() {
+        // Control characters are rejected and left as literal text.
+        assert_eq!(html_to_text("a&#0;b"), "a&#0;b");
+        // Out-of-range code points do not decode.
+        assert_eq!(html_to_text("a&#x110000;b"), "a&#x110000;b");
+        // Unknown named entities stay literal.
+        assert_eq!(html_to_text("a&nope;b"), "a&nope;b");
+        // Maximum accepted length is honored.
+        assert_eq!(html_to_text("&#65;"), "A");
+    }
+
+    #[test]
+    fn double_line_breaks_keep_paragraph_gap() {
+        assert_eq!(html_to_text("<p>a</p><br><br><p>b</p>"), "a\n\nb");
+        assert_eq!(html_to_text("a<br><br>b"), "a\n\nb");
     }
 }
