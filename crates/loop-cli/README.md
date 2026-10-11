@@ -28,8 +28,10 @@ On first start, Loop asks you to **connect a model provider** (unless a provider
 | OpenRouter | `/login openrouter` | `OPENROUTER_API_KEY` |
 | OpenAI | `/login openai` | `OPENAI_API_KEY` |
 | Any OpenAI-compatible API (Together, Groq, vLLM, Ollama, LM Studio, …) | `/login custom` (name, base URL, optional key) | — |
+| Tavily (web search) | `/login tavily` | `TAVILY_API_KEY` |
+| Brave Search (web search) | `/login brave` | `BRAVE_API_KEY` |
 
-Models are listed from each provider's `/models` endpoint; `/model` shows Soket first, then other connected providers. `/logout <provider>` disconnects one. Keys are stored in `~/.loop/agent/auth.json` (mode `0600`); custom providers are saved in `settings.json`.
+Models are listed from each provider's `/models` endpoint; `/model` shows Soket first, then other connected providers. `/logout <provider>` disconnects one. Keys are stored in `~/.loop/agent/auth.json` (mode `0600`); custom providers are saved in `settings.json`. The web-search keys enable the `web_search` tool (see [Web tools](#web-tools)).
 
 Default provider/model: **`soket` / `qwen3-30b`** at `https://api.soket.ai/v1`. The model catalog is refreshed from `GET /v1/models` and cached in `models-store.json`.
 
@@ -156,13 +158,17 @@ loopback, private, link-local and reserved addresses are refused before any
 connection (redirects re-checked per hop), and bodies are capped and truncated.
 It runs in the Loop process, not inside the sandbox.
 
-`web_search` returns ranked results (title, URL, snippet) and needs a backend
-plus an API key in the environment:
+`web_search` returns ranked results (title, URL, snippet). Connect a backend
+with the login wizard — the key is verified with a probe search, stored in
+`auth.json`, and the tool is enabled immediately (no restart):
 
-| Provider | `webSearch.provider` | Env var |
+| Provider | Connect | Env alternative |
 |---|---|---|
-| Tavily | `"tavily"` | `TAVILY_API_KEY` |
-| Brave Search | `"brave"` | `BRAVE_API_KEY` |
+| Tavily | `/login tavily` | `TAVILY_API_KEY` |
+| Brave Search | `/login brave` | `BRAVE_API_KEY` |
+
+`/logout tavily` (or `brave`) disables the tool again. Hand-written config in
+`settings.json` is also supported:
 
 ```json
 {
@@ -173,12 +179,14 @@ plus an API key in the environment:
 
 - `webFetch.allowPrivateAddresses`: `true` permits localhost/intranet URLs (for
   self-hosted mirrors; fails closed by default)  
-- `webSearch.apiKeyEnv`: custom env-var names, checked in order  
+- `webSearch.apiKeyEnv`: custom env-var names, checked before the saved key  
 - `webSearch.baseUrl`: point at a self-hosted search proxy  
 - `webSearch.allowPrivateAddresses`: allow a private `baseUrl`  
 - Both tools default to `ask` in `toolPermissions`; the approval prompt shows
   the URL / query, with an *Accept all web requests for this session* option  
-- If no key resolves, Loop starts without `web_search` and prints a note
+- Key resolution order: `webSearch.apiKeyEnv` env vars → the saved `/login`
+  key → the provider's default env var. With none present, Loop starts
+  without `web_search` and prints a note
 
 ## Extensions & hooks
 

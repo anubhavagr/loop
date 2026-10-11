@@ -9,7 +9,10 @@ pub mod trust;
 
 pub use auth::{provider_has_key, FileCredentialStore};
 pub use paths::*;
-pub use providers::{CustomProviderEntry, ProviderLoginRequest};
+pub use providers::{
+    CustomProviderEntry, ProviderLoginRequest, WEB_SEARCH_PROVIDERS, is_web_search_provider,
+    web_search_display_name,
+};
 pub use settings::{load_settings, Settings};
 #[cfg(feature = "telemetry")]
 pub use tracing::{

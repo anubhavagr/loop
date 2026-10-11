@@ -8,8 +8,9 @@ use anyhow::bail;
 use loop_agent::harness::{
     create_bash_tool, create_edit_tool, create_read_tool, create_session_repository,
     create_sqlite_session_store, create_web_fetch_tool, create_web_search_tool, create_write_tool,
-    AgentHarness, AgentHarnessOptions, AgentHarnessResources, HostExecutionEnv, KrunIsolation,
-    KrunSandbox, LocalSandboxRuntime, Sandbox, SandboxMode, WebFetchConfig, WebSearchConfig,
+    verify_web_search_key, AgentHarness, AgentHarnessOptions, AgentHarnessResources,
+    HostExecutionEnv, KrunIsolation, KrunSandbox, LocalSandboxRuntime, Sandbox, SandboxMode,
+    WebFetchConfig, WebSearchConfig,
 };
 use loop_agent::types::{AgentThinkingLevel, AgentTool};
 use loop_ai::providers::{custom_provider, CustomModelSpec, CustomProviderConfig};
@@ -245,6 +246,86 @@ impl Runtime {
         })
     }
 
+    /// `/login tavily|brave`: verify the key with a probe search, save it in the
+    /// credential store (auth.json), enable `webSearch` in settings and
+    /// register the `web_search` tool on the live harness. Nothing is kept if
+    /// the key is rejected.
+    pub async fn connect_web_search(
+        &mut self,
+        provider: &str,
+        api_key: &str,
+    ) -> anyhow::Result<String> {
+        let provider = provider.trim().to_ascii_lowercase();
+        let name = crate::config::web_search_display_name(&provider);
+        if !crate::config::is_web_search_provider(&provider) {
+            anyhow::bail!("unknown web-search provider '{provider}'");
+        }
+        if api_key.trim().is_empty() {
+            anyhow::bail!("{name} needs an API key");
+        }
+        // Keep a same-backend baseUrl / private-address opt-in when re-logging in.
+        let mut config = match &self.settings.web_search {
+            Some(existing) if existing.provider.eq_ignore_ascii_case(&provider) => existing.clone(),
+            _ => WebSearchConfig {
+                provider: provider.clone(),
+                ..Default::default()
+            },
+        };
+        config.provider = provider.clone();
+        verify_web_search_key(&config, api_key)
+            .await
+            .map_err(|e| anyhow::anyhow!("{name} rejected the key: {e}"))?;
+
+        self.credentials
+            .set(&provider, loop_ai::Credential::api_key(api_key));
+        self.settings.web_search = Some(config);
+        self.save_settings()?;
+        self.rebuild_tools().await?;
+        Ok(name)
+    }
+
+    /// `/logout tavily|brave`: forget the key; when it was the active backend,
+    /// disable `web_search` and drop the tool from the live harness.
+    pub async fn disconnect_web_search(&mut self, provider: &str) -> anyhow::Result<String> {
+        let provider = provider.trim().to_ascii_lowercase();
+        let name = crate::config::web_search_display_name(&provider);
+        let active = self
+            .settings
+            .web_search
+            .as_ref()
+            .is_some_and(|c| c.provider.eq_ignore_ascii_case(&provider));
+        if !active && self.credentials.get(&provider).is_none() {
+            anyhow::bail!("{provider} is not connected");
+        }
+        self.credentials.remove(&provider);
+        if active {
+            self.settings.web_search = None;
+            self.save_settings()?;
+            self.rebuild_tools().await?;
+        }
+        Ok(name)
+    }
+
+    /// Swap the harness tool set for a freshly built one (keeps MCP tools).
+    async fn rebuild_tools(&self) -> anyhow::Result<()> {
+        let env = self
+            .harness
+            .tool_env()
+            .await
+            .map_err(|e| anyhow::anyhow!("tool env: {e}"))?;
+        let tools = build_tools(
+            env,
+            self.settings.web_fetch,
+            self.settings.web_search.as_ref(),
+            Some(self.credentials.as_ref()),
+        );
+        self.harness
+            .set_tools(tools)
+            .await
+            .map_err(|e| anyhow::anyhow!("set tools: {e}"))?;
+        self.refresh_mcp_tools().await
+    }
+
     /// `/logout`: forget the provider's key; custom providers are removed entirely. A
     /// selected model from that provider is deselected.
     pub async fn disconnect_provider(&mut self, id: &str) -> anyhow::Result<String> {
@@ -406,11 +487,13 @@ pub struct BootstrapOpts {
 /// Build the standard tool set bound to an execution environment.
 ///
 /// `web_fetch` is always included (subject to `web_fetch` settings); `web_search`
-/// is included only when a backend is configured and its API key resolves.
+/// is included only when a backend is configured and its API key resolves
+/// (`apiKeyEnv` env vars → saved `/login` key → backend default env var).
 pub fn build_tools(
     env: Arc<dyn loop_agent::harness::ExecutionEnv>,
     web_fetch: WebFetchConfig,
     web_search: Option<&WebSearchConfig>,
+    credentials: Option<&FileCredentialStore>,
 ) -> Vec<AgentTool> {
     let mut tools = vec![
         create_read_tool(Arc::clone(&env)),
@@ -423,7 +506,13 @@ pub fn build_tools(
         Err(e) => tracing::warn!("web_fetch disabled: {e}"),
     }
     if let Some(config) = web_search {
-        match create_web_search_tool(config.clone()) {
+        let stored_key = credentials
+            .and_then(|store| store.get(&config.provider.trim().to_ascii_lowercase()))
+            .and_then(|credential| match credential {
+                loop_ai::Credential::ApiKey { key } => Some(key),
+                _ => None,
+            });
+        match create_web_search_tool(config.clone(), stored_key.as_deref()) {
             Ok(tool) => tools.push(tool),
             Err(e) => {
                 tracing::warn!("web_search disabled: {e}");
@@ -748,6 +837,7 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         Arc::clone(&tool_env),
         settings.web_fetch,
         settings.web_search.as_ref(),
+        Some(credentials.as_ref()),
     );
 
     // The prompt lists the tools that were actually built (web_search may be

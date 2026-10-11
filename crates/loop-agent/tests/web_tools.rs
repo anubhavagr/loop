@@ -184,8 +184,11 @@ async fn search_tavily_backend() {
             {"title": "Docs", "url": "https://doc.rust-lang.org", "content": "Book"}
         ]}"#,
     ));
-    let tool = create_web_search_tool(search_config(&server, "LOOP_TEST_TAVILY_KEY", "tavily"))
-        .expect("web_search tool");
+    let tool = create_web_search_tool(
+        search_config(&server, "LOOP_TEST_TAVILY_KEY", "tavily"),
+        None,
+    )
+    .expect("web_search tool");
     let result = run(&tool, json!({"query": "rust language", "max_results": 2}))
         .await
         .expect("search ok");
@@ -216,7 +219,7 @@ async fn search_brave_backend() {
             {"title": "Rust", "url": "https://rust-lang.org", "description": "Systems language"}
         ]}}"#,
     ));
-    let tool = create_web_search_tool(search_config(&server, "LOOP_TEST_BRAVE_KEY", "brave"))
+    let tool = create_web_search_tool(search_config(&server, "LOOP_TEST_BRAVE_KEY", "brave"), None)
         .expect("web_search tool");
     let result = run(&tool, json!({"query": "rust"}))
         .await
@@ -236,11 +239,14 @@ async fn search_brave_backend() {
 async fn search_requires_an_api_key() {
     std::env::remove_var("LOOP_TEST_MISSING_KEY");
     let err = expect_creation_error(
-        create_web_search_tool(loop_agent::harness::WebSearchConfig {
-            provider: "tavily".into(),
-            api_key_env: vec!["LOOP_TEST_MISSING_KEY".into()],
-            ..Default::default()
-        }),
+        create_web_search_tool(
+            loop_agent::harness::WebSearchConfig {
+                provider: "tavily".into(),
+                api_key_env: vec!["LOOP_TEST_MISSING_KEY".into()],
+                ..Default::default()
+            },
+            None,
+        ),
         "missing key must fail tool creation",
     );
     assert!(err.contains("API key"), "unexpected error: {err}");
@@ -250,11 +256,14 @@ async fn search_requires_an_api_key() {
 async fn search_rejects_unknown_provider() {
     std::env::set_var("LOOP_TEST_ANY_KEY", "k");
     let err = expect_creation_error(
-        create_web_search_tool(loop_agent::harness::WebSearchConfig {
-            provider: "altavista".into(),
-            api_key_env: vec!["LOOP_TEST_ANY_KEY".into()],
-            ..Default::default()
-        }),
+        create_web_search_tool(
+            loop_agent::harness::WebSearchConfig {
+                provider: "altavista".into(),
+                api_key_env: vec!["LOOP_TEST_ANY_KEY".into()],
+                ..Default::default()
+            },
+            None,
+        ),
         "unknown provider must fail tool creation",
     );
     assert!(err.contains("altavista"), "unexpected error: {err}");
@@ -265,12 +274,15 @@ async fn search_rejects_private_base_urls_by_default() {
     let server = FakeHttpServer::always(FakeResponse::json("{}"));
     std::env::set_var("LOOP_TEST_STRICT_KEY", "k");
     let err = expect_creation_error(
-        create_web_search_tool(loop_agent::harness::WebSearchConfig {
-            provider: "tavily".into(),
-            api_key_env: vec!["LOOP_TEST_STRICT_KEY".into()],
-            base_url: Some(server.base_url().to_string()),
-            ..Default::default()
-        }),
+        create_web_search_tool(
+            loop_agent::harness::WebSearchConfig {
+                provider: "tavily".into(),
+                api_key_env: vec!["LOOP_TEST_STRICT_KEY".into()],
+                base_url: Some(server.base_url().to_string()),
+                ..Default::default()
+            },
+            None,
+        ),
         "strict policy must refuse loopback base URL",
     );
     assert!(err.contains("refusing"), "unexpected error: {err}");
@@ -282,11 +294,70 @@ async fn search_clamps_max_results() {
     let server = FakeHttpServer::always(FakeResponse::json(
         r#"{"results":[{"title":"a","url":"https://a","content":"c"}]}"#,
     ));
-    let tool = create_web_search_tool(search_config(&server, "LOOP_TEST_CLAMP_KEY", "tavily"))
-        .expect("web_search tool");
+    let tool = create_web_search_tool(
+        search_config(&server, "LOOP_TEST_CLAMP_KEY", "tavily"),
+        None,
+    )
+    .expect("web_search tool");
     run(&tool, json!({"query": "x", "max_results": 99}))
         .await
         .expect("search ok");
     let body: serde_json::Value = serde_json::from_slice(&server.requests()[0].body).unwrap();
     assert_eq!(body["max_results"], 10);
+}
+
+#[tokio::test]
+async fn search_uses_the_stored_login_key() {
+    std::env::remove_var("TAVILY_API_KEY");
+    std::env::remove_var("LOOP_TEST_STORED_KEY");
+    let server = FakeHttpServer::always(FakeResponse::json(
+        r#"{"results":[{"title":"t","url":"https://t","content":"c"}]}"#,
+    ));
+    // No env keys configured at all — the key comes from the `/login` store.
+    let mut config = search_config(&server, "LOOP_TEST_STORED_KEY", "tavily");
+    config.api_key_env = vec![];
+    let tool = create_web_search_tool(config, Some("tvly-stored")).expect("web_search tool");
+    run(&tool, json!({"query": "q"})).await.expect("search ok");
+    assert_eq!(
+        server.requests()[0].header("authorization"),
+        Some("Bearer tvly-stored")
+    );
+}
+
+#[tokio::test]
+async fn search_env_key_overrides_the_stored_key() {
+    std::env::set_var("LOOP_TEST_OVERRIDE_KEY", "tvly-from-env");
+    let server = FakeHttpServer::always(FakeResponse::json(
+        r#"{"results":[{"title":"t","url":"https://t","content":"c"}]}"#,
+    ));
+    let tool = create_web_search_tool(
+        search_config(&server, "LOOP_TEST_OVERRIDE_KEY", "tavily"),
+        Some("tvly-stored"),
+    )
+    .expect("web_search tool");
+    run(&tool, json!({"query": "q"})).await.expect("search ok");
+    assert_eq!(
+        server.requests()[0].header("authorization"),
+        Some("Bearer tvly-from-env")
+    );
+}
+
+#[tokio::test]
+async fn key_verification_probes_and_reports_rejections() {
+    use loop_agent::harness::verify_web_search_key;
+
+    let ok = FakeHttpServer::always(FakeResponse::json(
+        r#"{"results":[{"title":"t","url":"https://t","content":"c"}]}"#,
+    ));
+    let config = search_config(&ok, "LOOP_TEST_VERIFY_KEY", "tavily");
+    verify_web_search_key(&config, "tvly-good")
+        .await
+        .expect("key accepted");
+
+    let rejected = FakeHttpServer::always(FakeResponse::new(401, "application/json", "{}"));
+    let config = search_config(&rejected, "LOOP_TEST_VERIFY_KEY", "tavily");
+    let err = verify_web_search_key(&config, "tvly-bad")
+        .await
+        .expect_err("401 must fail verification");
+    assert!(err.contains("rejected"), "unexpected error: {err}");
 }

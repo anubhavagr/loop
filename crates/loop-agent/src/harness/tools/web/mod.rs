@@ -16,7 +16,7 @@ mod guard;
 mod html;
 mod search;
 
-pub use search::{create_web_search_tool, WebSearchConfig};
+pub use search::{create_web_search_tool, verify_web_search_key, WebSearchConfig};
 
 use std::sync::OnceLock;
 use std::time::Duration;

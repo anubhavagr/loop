@@ -52,6 +52,7 @@ use crate::tui::{
     render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus, ChatItem, CommandHistory,
     FileEntry, FooterOpts, InputBuffer, McpServerListing, PickerRow, PickerView, FOOTER_HEIGHT,
 };
+use crate::config::ProviderLoginRequest;
 use crate::{build_tools, CliRuntime};
 
 #[allow(
@@ -3547,12 +3548,21 @@ async fn advance_provider_setup(
         return;
     };
     *status = format!("login · connecting {}…", request.display_name());
-    match runtime.connect_provider(&request).await {
-        Ok(connected) => {
+    let connected = match &request {
+        ProviderLoginRequest::WebSearch { id, api_key } => {
+            runtime.connect_web_search(id, api_key).await.map(|name| {
+                chat.push(sys(format!("✓ Connected {name} · web_search enabled")));
+            })
+        }
+        _ => runtime.connect_provider(&request).await.map(|connected| {
             chat.push(sys(format!(
                 "✓ Connected {} · {} models — /model to choose one",
                 connected.name, connected.model_count
             )));
+        }),
+    };
+    match connected {
+        Ok(()) => {
             *status = "ready · /help for commands".into();
         }
         Err(err) => {
@@ -3567,7 +3577,10 @@ async fn advance_provider_setup(
 /// `/logout [provider]`: returns the line to show in the transcript.
 async fn apply_logout(provider: Option<String>, runtime: &mut CliRuntime) -> String {
     let Some(provider) = provider else {
-        let connected = runtime.connected_providers();
+        let mut connected = runtime.connected_providers();
+        if let Some(web) = &runtime.settings.web_search {
+            connected.push(web.provider.clone());
+        }
         return if connected.is_empty() {
             "Usage: /logout <provider> · no providers are connected".into()
         } else {
@@ -3577,6 +3590,12 @@ async fn apply_logout(provider: Option<String>, runtime: &mut CliRuntime) -> Str
             )
         };
     };
+    if loop_app_core::config::is_web_search_provider(&provider) {
+        return match runtime.disconnect_web_search(&provider).await {
+            Ok(name) => format!("logged out: {name} · web_search disabled"),
+            Err(err) => format!("logout: {err:#}"),
+        };
+    }
     match runtime.disconnect_provider(&provider).await {
         Ok(name) => format!("logged out: {name}"),
         Err(err) => format!("logout: {err:#}"),
@@ -3703,6 +3722,7 @@ async fn apply_effect(
                     let harness = Arc::clone(&runtime.harness);
                     let web_fetch = runtime.settings.web_fetch;
                     let web_search = runtime.settings.web_search.clone();
+                    let credentials = Arc::clone(&runtime.credentials);
                     let tx = tx.clone();
                     *working = true;
                     *status = "disabling sandbox…".into();
@@ -3716,7 +3736,12 @@ async fn apply_effect(
                                 .await
                                 .map_err(|e| format!("sandbox: {e}"))?;
                             harness
-                                .set_tools(build_tools(env, web_fetch, web_search.as_ref()))
+                                .set_tools(build_tools(
+                                    env,
+                                    web_fetch,
+                                    web_search.as_ref(),
+                                    Some(credentials.as_ref()),
+                                ))
                                 .await
                                 .map_err(|e| format!("sandbox: {e}"))?;
                             Ok(SandboxDoneOk::Off)
@@ -3738,6 +3763,7 @@ async fn apply_effect(
                     let cwd = runtime.cwd.clone();
                     let web_fetch = runtime.settings.web_fetch;
                     let web_search = runtime.settings.web_search.clone();
+                    let credentials = Arc::clone(&runtime.credentials);
                     let tx = tx.clone();
                     let iso_s = isolation.as_str().to_string();
                     let rt_s = oci_runtime.as_str().to_string();
@@ -3759,6 +3785,7 @@ async fn apply_effect(
                                     Arc::clone(&env),
                                     web_fetch,
                                     web_search.as_ref(),
+                                    Some(credentials.as_ref()),
                                 ))
                                 .await
                             {

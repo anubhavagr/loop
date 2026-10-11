@@ -47,39 +47,47 @@ enum SearchBackend {
 }
 
 impl SearchBackend {
-    /// Resolve the backend from config, reading the API key from the
-    /// environment. `Err` explains why the tool cannot be created.
-    fn resolve(config: &WebSearchConfig) -> Result<Self, String> {
-        let policy = FetchPolicy {
-            allow_private_addresses: config.allow_private_addresses,
-        };
+    /// Resolve the backend from config. The API key comes from `apiKeyEnv`
+    /// env vars, the stored key (auth.json), or the backend's default env var,
+    /// in that order. `Err` explains why the tool cannot be created.
+    fn resolve(config: &WebSearchConfig, stored_key: Option<&str>) -> Result<Self, String> {
         match config.provider.trim().to_ascii_lowercase().as_str() {
-            "tavily" => Ok(Self::Tavily {
-                api_key: read_api_key(&config.api_key_env, "TAVILY_API_KEY")
-                    .ok_or("no API key: set TAVILY_API_KEY or webSearch.apiKeyEnv")?,
-                base_url: resolve_base_url(
-                    config
-                        .base_url
-                        .as_deref()
-                        .unwrap_or("https://api.tavily.com"),
-                    policy,
-                )?,
-            }),
-            "brave" => Ok(Self::Brave {
-                api_key: read_api_key(&config.api_key_env, "BRAVE_API_KEY")
-                    .ok_or("no API key: set BRAVE_API_KEY or webSearch.apiKeyEnv")?,
-                base_url: resolve_base_url(
-                    config
-                        .base_url
-                        .as_deref()
-                        .unwrap_or("https://api.search.brave.com"),
-                    policy,
-                )?,
-            }),
+            "tavily" => Self::new(
+                "tavily",
+                resolve_api_key(config, stored_key, "TAVILY_API_KEY")
+                    .ok_or("no API key: run /login tavily, or set TAVILY_API_KEY")?,
+                config,
+            ),
+            "brave" => Self::new(
+                "brave",
+                resolve_api_key(config, stored_key, "BRAVE_API_KEY")
+                    .ok_or("no API key: run /login brave, or set BRAVE_API_KEY")?,
+                config,
+            ),
             other => Err(format!(
                 "unknown provider '{other}' (expected 'tavily' or 'brave')"
             )),
         }
+    }
+
+    /// Build a backend for an explicit provider id and key (verification path).
+    fn new(provider: &str, api_key: String, config: &WebSearchConfig) -> Result<Self, String> {
+        if api_key.trim().is_empty() {
+            return Err(format!("{provider}: API key is empty"));
+        }
+        let policy = FetchPolicy {
+            allow_private_addresses: config.allow_private_addresses,
+        };
+        let default_base = match provider {
+            "brave" => "https://api.search.brave.com",
+            _ => "https://api.tavily.com",
+        };
+        let base_url =
+            resolve_base_url(config.base_url.as_deref().unwrap_or(default_base), policy)?;
+        Ok(match provider {
+            "brave" => Self::Brave { base_url, api_key },
+            _ => Self::Tavily { base_url, api_key },
+        })
     }
 
     /// Backend id for result details.
@@ -148,15 +156,19 @@ fn check_status(status: reqwest::StatusCode, backend: &str) -> Result<(), String
     }
 }
 
-fn read_api_key(env_names: &[String], fallback: &str) -> Option<String> {
-    env_names
+/// API key resolution order: `apiKeyEnv` env vars → stored key → default env.
+fn resolve_api_key(
+    config: &WebSearchConfig,
+    stored_key: Option<&str>,
+    default_env: &str,
+) -> Option<String> {
+    let non_empty = |v: String| (!v.trim().is_empty()).then_some(v);
+    config
+        .api_key_env
         .iter()
-        .find_map(|name| std::env::var(name).ok().filter(|v| !v.trim().is_empty()))
-        .or_else(|| {
-            std::env::var(fallback)
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-        })
+        .find_map(|name| std::env::var(name).ok().and_then(non_empty))
+        .or_else(|| stored_key.and_then(|k| non_empty(k.to_string())))
+        .or_else(|| std::env::var(default_env).ok().and_then(non_empty))
 }
 
 fn parse_base_url(raw: &str) -> Result<Url, String> {
@@ -220,8 +232,15 @@ fn parse_brave(body: &Value) -> Result<Vec<SearchHit>, String> {
 
 /// Build the `web_search` tool. `Err` (missing key, unknown provider, bad base
 /// URL) should be reported by the caller and the tool left unregistered.
-pub fn create_web_search_tool(config: WebSearchConfig) -> Result<crate::types::AgentTool, String> {
-    let backend = SearchBackend::resolve(&config)?;
+/// Build the `web_search` tool. `stored_key` is the key saved by `/login`
+/// (auth.json); env vars from `apiKeyEnv` take precedence over it. `Err`
+/// (missing key, unknown provider, bad base URL) should be reported by the
+/// caller and the tool left unregistered.
+pub fn create_web_search_tool(
+    config: WebSearchConfig,
+    stored_key: Option<&str>,
+) -> Result<crate::types::AgentTool, String> {
+    let backend = SearchBackend::resolve(&config, stored_key)?;
     let policy = FetchPolicy {
         allow_private_addresses: config.allow_private_addresses,
     };
@@ -274,6 +293,28 @@ pub fn create_web_search_tool(config: WebSearchConfig) -> Result<crate::types::A
             }
         },
     ))
+}
+
+/// Verify an API key before saving it: run a one-result probe search.
+/// Auth failures (401/403) are reported as a rejected key; a probe costs one
+/// query on the backend's free tier.
+pub async fn verify_web_search_key(config: &WebSearchConfig, api_key: &str) -> Result<(), String> {
+    let provider = config.provider.trim().to_ascii_lowercase();
+    let backend = SearchBackend::new(&provider, api_key.to_string(), config)?;
+    let policy = FetchPolicy {
+        allow_private_addresses: config.allow_private_addresses,
+    };
+    let client = super::shared_client(policy)?;
+    match backend
+        .search(&client, "loop agent connectivity check", 1)
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(e) if e.contains("401") || e.contains("403") => {
+            Err(format!("{} rejected the API key", backend.id()))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]

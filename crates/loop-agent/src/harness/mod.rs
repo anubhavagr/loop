@@ -46,6 +46,7 @@ pub use tools::{create_bash_tool, create_edit_tool, create_read_tool, create_wri
 #[cfg(feature = "web")]
 pub use tools::web::{
     WebFetchConfig, WebSearchConfig, create_web_fetch_tool, create_web_search_tool,
+    verify_web_search_key,
 };
 pub use types::{
     AgentHarnessError, AgentHarnessPhase, AgentHarnessResources, CompactResult, ExecutionEnv,
