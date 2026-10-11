@@ -124,7 +124,7 @@ If deps for the chosen runtime are missing, Loop prints install instructions and
 
 ## File edit review / tool approval
 
-On **new sessions**, `write` / `edit` / `bash` pause for approval (per `toolPermissions`). File edits open Cursor or VS Code with `--diff`. Options:
+On **new sessions**, `write` / `edit` / `bash` / `web_fetch` / `web_search` pause for approval (per `toolPermissions`). File edits open Cursor or VS Code with `--diff`. Options:
 
 1. **Accept** — this change only  
 2. **Accept all … for this session** — remembered on the session (survives resume)  
@@ -145,8 +145,40 @@ On **new sessions**, `write` / `edit` / `bash` pause for approval (per `toolPerm
 
 - `fileEditReview`: `newSession` (default) · `always` · `never` — when `ask` tools prompt  
 - `toolPermissions`: per-tool `ask` | `allow` | `deny` in `~/.loop/agent/settings.json`  
-- Interactive workflows are wired for `write`, `edit`, and `bash` (others can be configured for later)  
+- Interactive workflows are wired for `write`, `edit`, `bash`, `web_fetch`, and `web_search`  
 - `/review [newSession|always|never]` toggles the ask policy
+
+## Web tools
+
+`web_fetch` is built in: it fetches an http(s) URL and returns the body as text
+(HTML pages become plain text). Only public internet hosts are reachable —
+loopback, private, link-local and reserved addresses are refused before any
+connection (redirects re-checked per hop), and bodies are capped and truncated.
+It runs in the Loop process, not inside the sandbox.
+
+`web_search` returns ranked results (title, URL, snippet) and needs a backend
+plus an API key in the environment:
+
+| Provider | `webSearch.provider` | Env var |
+|---|---|---|
+| Tavily | `"tavily"` | `TAVILY_API_KEY` |
+| Brave Search | `"brave"` | `BRAVE_API_KEY` |
+
+```json
+{
+  "webFetch": { "allowPrivateAddresses": false },
+  "webSearch": { "provider": "tavily" }
+}
+```
+
+- `webFetch.allowPrivateAddresses`: `true` permits localhost/intranet URLs (for
+  self-hosted mirrors; fails closed by default)  
+- `webSearch.apiKeyEnv`: custom env-var names, checked in order  
+- `webSearch.baseUrl`: point at a self-hosted search proxy  
+- `webSearch.allowPrivateAddresses`: allow a private `baseUrl`  
+- Both tools default to `ask` in `toolPermissions`; the approval prompt shows
+  the URL / query, with an *Accept all web requests for this session* option  
+- If no key resolves, Loop starts without `web_search` and prints a note
 
 ## Extensions & hooks
 

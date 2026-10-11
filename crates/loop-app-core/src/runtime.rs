@@ -7,9 +7,9 @@ use anyhow::bail;
 
 use loop_agent::harness::{
     create_bash_tool, create_edit_tool, create_read_tool, create_session_repository,
-    create_sqlite_session_store, create_write_tool, AgentHarness, AgentHarnessOptions,
-    AgentHarnessResources, HostExecutionEnv, KrunIsolation, KrunSandbox, LocalSandboxRuntime,
-    Sandbox, SandboxMode,
+    create_sqlite_session_store, create_web_fetch_tool, create_web_search_tool, create_write_tool,
+    AgentHarness, AgentHarnessOptions, AgentHarnessResources, HostExecutionEnv, KrunIsolation,
+    KrunSandbox, LocalSandboxRuntime, Sandbox, SandboxMode, WebFetchConfig, WebSearchConfig,
 };
 use loop_agent::types::{AgentThinkingLevel, AgentTool};
 use loop_ai::providers::{custom_provider, CustomModelSpec, CustomProviderConfig};
@@ -404,13 +404,34 @@ pub struct BootstrapOpts {
 }
 
 /// Build the standard tool set bound to an execution environment.
-pub fn build_tools(env: Arc<dyn loop_agent::harness::ExecutionEnv>) -> Vec<AgentTool> {
-    vec![
+///
+/// `web_fetch` is always included (subject to `web_fetch` settings); `web_search`
+/// is included only when a backend is configured and its API key resolves.
+pub fn build_tools(
+    env: Arc<dyn loop_agent::harness::ExecutionEnv>,
+    web_fetch: WebFetchConfig,
+    web_search: Option<&WebSearchConfig>,
+) -> Vec<AgentTool> {
+    let mut tools = vec![
         create_read_tool(Arc::clone(&env)),
         create_write_tool(Arc::clone(&env)),
         create_edit_tool(Arc::clone(&env)),
         create_bash_tool(env),
-    ]
+    ];
+    match create_web_fetch_tool(web_fetch) {
+        Ok(tool) => tools.push(tool),
+        Err(e) => tracing::warn!("web_fetch disabled: {e}"),
+    }
+    if let Some(config) = web_search {
+        match create_web_search_tool(config.clone()) {
+            Ok(tool) => tools.push(tool),
+            Err(e) => {
+                tracing::warn!("web_search disabled: {e}");
+                eprintln!("note: web_search not enabled: {e}");
+            }
+        }
+    }
+    tools
 }
 
 /// Ensure at least one LLM provider is connected, or defer to the TUI's `/login` wizard.
@@ -647,16 +668,6 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         opts.system_prompt.as_deref(),
         opts.append_system_prompt.as_deref(),
     );
-    let snippets = default_tool_snippets();
-    let selected = ["read", "bash", "edit", "write"];
-    let system_prompt = build_system_prompt(BuildSystemPromptOptions {
-        custom_prompt: custom.as_deref(),
-        append_system_prompt: append.as_deref(),
-        cwd: &opts.cwd,
-        selected_tools: &selected,
-        tool_snippets: &snippets,
-        context_files: &context_files,
-    });
 
     let sessions_db = sessions_db_path(&agent_dir);
     let store = create_sqlite_session_store(&sessions_db)
@@ -733,7 +744,24 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
             }
         };
 
-    let tools = build_tools(Arc::clone(&tool_env));
+    let tools = build_tools(
+        Arc::clone(&tool_env),
+        settings.web_fetch,
+        settings.web_search.as_ref(),
+    );
+
+    // The prompt lists the tools that were actually built (web_search may be
+    // unconfigured), so it can never promise a tool the agent cannot call.
+    let snippets = default_tool_snippets();
+    let selected: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    let system_prompt = build_system_prompt(BuildSystemPromptOptions {
+        custom_prompt: custom.as_deref(),
+        append_system_prompt: append.as_deref(),
+        cwd: &opts.cwd,
+        selected_tools: &selected,
+        tool_snippets: &snippets,
+        context_files: &context_files,
+    });
 
     let session_id = session.metadata().id.clone();
     let harness = Arc::new(AgentHarness::new(AgentHarnessOptions {

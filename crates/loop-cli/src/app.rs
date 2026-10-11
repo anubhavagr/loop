@@ -3701,6 +3701,8 @@ async fn apply_effect(
             match parts.as_slice() {
                 ["off"] | ["disabled"] => {
                     let harness = Arc::clone(&runtime.harness);
+                    let web_fetch = runtime.settings.web_fetch;
+                    let web_search = runtime.settings.web_search.clone();
                     let tx = tx.clone();
                     *working = true;
                     *status = "disabling sandbox…".into();
@@ -3714,7 +3716,7 @@ async fn apply_effect(
                                 .await
                                 .map_err(|e| format!("sandbox: {e}"))?;
                             harness
-                                .set_tools(build_tools(env))
+                                .set_tools(build_tools(env, web_fetch, web_search.as_ref()))
                                 .await
                                 .map_err(|e| format!("sandbox: {e}"))?;
                             Ok(SandboxDoneOk::Off)
@@ -3734,6 +3736,8 @@ async fn apply_effect(
                     };
                     let harness = Arc::clone(&runtime.harness);
                     let cwd = runtime.cwd.clone();
+                    let web_fetch = runtime.settings.web_fetch;
+                    let web_search = runtime.settings.web_search.clone();
                     let tx = tx.clone();
                     let iso_s = isolation.as_str().to_string();
                     let rt_s = oci_runtime.as_str().to_string();
@@ -3750,7 +3754,14 @@ async fn apply_effect(
                             ));
                             sb.start().await.map_err(|e| e.to_string())?;
                             let env = sb.env();
-                            if let Err(e) = harness.set_tools(build_tools(Arc::clone(&env))).await {
+                            if let Err(e) = harness
+                                .set_tools(build_tools(
+                                    Arc::clone(&env),
+                                    web_fetch,
+                                    web_search.as_ref(),
+                                ))
+                                .await
+                            {
                                 let _ = sb.destroy().await;
                                 return Err(format!("sandbox: {e}"));
                             }
